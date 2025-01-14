@@ -1,0 +1,13 @@
+.env/
+output/
+generated/
+checkpoints/
+wandb/
+__pycache__/
+*_sharded/
+*.mp4
+*.pb
+*.avi
+*.bin
+*.npz
+*.pth

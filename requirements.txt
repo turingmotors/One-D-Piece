@@ -1,0 +1,27 @@
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.1.2+cu121
+torchvision
+omegaconf
+transformers
+timm
+open_clip_torch
+einops
+scipy
+pillow
+accelerate
+gdown
+huggingface-hub
+einops
+wandb
+torch-fidelity
+torchinfo
+webdataset
+termcolor
+iopath
+datasets
+numpy<2.0
+opencv-python
+scikit-image
+lpips
+torcheval
+tqdm

@@ -1,0 +1,94 @@
+experiment:
+    project: "generator_model"
+    name: "one_d_piece_b256_maskgit"
+    output_dir: "checkpoints/one_d_piece_b256_maskgit_run1"
+    max_train_examples: 1_281_167
+    save_every: 10_000
+    eval_every: 50_000
+    generate_every: 500
+    log_every: 50
+    log_grad_norm_every: 1_000
+    resume: True
+    explanation: ""
+    tokenizer_checkpoint: "one-d-piece_b256.bin"
+
+model:
+    type: "one_d_piece"
+    vq_model:
+        codebook_size: 4096
+        token_size: 12
+        use_l2_norm: True
+        commitment_cost: 0.25
+        # vit arch
+        vit_enc_model_size: "base"
+        vit_dec_model_size: "base"
+        vit_enc_patch_size: 16
+        vit_dec_patch_size: 16
+        num_latent_tokens: 256
+        finetune_decoder: True
+        # relax assertion
+        strict_length_assertion: False
+        pretrained_tokenizer_weight: "maskgit-vqgan-imagenet-f16-256.bin"
+    
+    generator_type: "maskgit"
+    generator:
+        model_type: "ViT"
+        hidden_size: 768
+        num_hidden_layers: 24
+        num_attention_heads: 16
+        intermediate_size: 3072
+        dropout: 0.1
+        attn_drop: 0.1
+        class_label_dropout: 0.1
+        image_seq_len: ${model.vq_model.num_latent_tokens}
+        condition_num_classes: 1000
+
+        # sampling hyper-params on the flight
+        # best params
+        num_steps: 16
+        randomize_temperature: 2.5
+        guidance_scale: 8.5
+        guidance_decay: "power-cosine"
+
+losses:
+    label_smoothing: 0.1
+    loss_weight_unmasked_token: 0.1
+
+dataset:
+    params:
+        train_shards_path_or_url: "/data/dataset/imagenet/imagenet-train-{000000..000320}.tar"
+        eval_shards_path_or_url: "/data/dataset/imagenet/imagenet-val-{000000..000049}.tar"
+        num_workers_per_gpu: 12
+    preprocessing:
+        resize_shorter_edge: 256
+        crop_size: 256
+        random_crop: False
+        random_flip: True
+
+optimizer:
+    name: adamw 
+    params:
+        learning_rate: 2e-4
+        beta1: 0.9
+        beta2: 0.96
+        weight_decay: 0.03
+
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 10_000
+        end_lr: 1e-5
+
+
+training:
+    gradient_accumulation_steps: 1
+    per_gpu_batch_size: 256 # 8 GPU, total batch size 2048
+    mixed_precision: "bf16"
+    enable_tf32: True
+    enable_wandb: True
+    use_ema: True
+    seed: 42
+    max_train_steps: 500_000
+    max_grad_norm: 1.0

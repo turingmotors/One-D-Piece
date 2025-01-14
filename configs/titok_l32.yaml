@@ -1,0 +1,51 @@
+experiment:
+    project: "titok_l32_eval"
+    name: "titok_l32_eval"
+    output_dir: "titok_l32_eval"
+    max_train_examples: 1_281_167
+    save_every: 10_000
+    eval_every: 10_000
+    generate_every: 500
+    log_every: 50
+    log_grad_norm_every: 1_000
+    resume: False
+    init_weight: "tokenizer_titok_l32.bin"
+
+model:
+    type: "titok"
+    vq_model:
+        codebook_size: 4096
+        token_size: 12
+        use_l2_norm: True
+        commitment_cost: 0.25
+        # vit arch
+        vit_enc_model_size: "large"
+        vit_dec_model_size: "large"
+        vit_enc_patch_size: 16
+        vit_dec_patch_size: 16
+        num_latent_tokens: 32
+        finetune_decoder: True
+
+dataset:
+    params:
+        train_shards_path_or_url: "/data/dataset/imagenet/imagenet-train-{000000..000320}.tar"
+        eval_shards_path_or_url: "/data/dataset/imagenet/imagenet-val-{000000..000049}.tar"
+        num_workers_per_gpu: 12
+    preprocessing:
+        resize_shorter_edge: 256
+        crop_size: 256
+        random_crop: False
+        random_flip: False
+
+
+training:
+    gradient_accumulation_steps: 1
+    per_gpu_batch_size: 256
+    mixed_precision: "bf16"
+    enable_tf32: True
+    enable_wandb: True
+    use_ema: True
+    seed: 42
+    max_train_steps: 500_000
+    num_generated_images: 2
+    max_grad_norm: 1.0
