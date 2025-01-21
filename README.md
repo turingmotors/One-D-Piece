@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Paper](https://img.shields.io/badge/arXiv-Paper-Red.svg)]([https://tur.ing/](https://arxiv.org/abs/2501.10064))&nbsp;&nbsp;
+[![Paper](https://img.shields.io/badge/arXiv-Paper-Red.svg)](https://arxiv.org/abs/2501.10064)&nbsp;&nbsp;
 [![Website](https://img.shields.io/badge/Project-Website-87CEEB)](https://turingmotors.github.io/one-d-piece-tokenizer/)&nbsp;&nbsp;
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weights-blue)](https://huggingface.co/collections/turing-motors/one-d-piece-6785c8c5fea9f9a5104d142e)&nbsp;&nbsp;
 </div>
