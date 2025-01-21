@@ -2,9 +2,9 @@
 
 <div align="center">
 
-[![demo](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Online_Demo-blue)](https://tur.ing/)&nbsp;&nbsp;
-[![Website](https://img.shields.io/badge/Project-Website-87CEEB)](https://tur.ing/)&nbsp;&nbsp;
-[![paper](https://img.shields.io/badge/arXiv-Paper-<COLOR>.svg)](https://tur.ing/)&nbsp;&nbsp;
+[![Paper](https://img.shields.io/badge/arXiv-Paper-Red.svg)]([https://tur.ing/](https://arxiv.org/abs/2501.10064))&nbsp;&nbsp;
+[![Website](https://img.shields.io/badge/Project-Website-87CEEB)](https://turingmotors.github.io/one-d-piece-tokenizer/)&nbsp;&nbsp;
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weights-blue)](https://huggingface.co/collections/turing-motors/one-d-piece-6785c8c5fea9f9a5104d142e)&nbsp;&nbsp;
 </div>
 
 
@@ -18,12 +18,12 @@ We propose **One-D-Piece**, a novel image tokenizer supporting quality-controlla
 
 | Dataset  | Model | Link | FID |
 | ------------- | ------------- | ------------- | ------------- |
-| ImageNet  | One-D-Piece-L-256 Tokenizer | [checkpoint (TBP)](https://huggingface.co/turing-motors/One-D-Piece-L-256)| 1.08 (reconstruction) |
-| ImageNet  | One-D-Piece-B-256 Tokenizer | [checkpoint (TBP)](https://huggingface.co/turing-motors/One-D-Piece-B-256) | 1.11 (reconstruction) |
-| ImageNet  | One-D-Piece-S-256 Tokenizer | [checkpoint (TBP)](https://huggingface.co/turing-motors/One-D-Piece-S-256) | 1.48 (reconstruction) |
-| ImageNet  | One-D-Piece-L-256 Generator | [checkpoint (TBP)](https://huggingface.co/turing-motors/MaskGIT_One-D-Piece-L-256)| 2.35 (generation) |
-| ImageNet  | One-D-Piece-B-256 Generator | [checkpoint (TBP)](https://huggingface.co/turing-motors/MaskGIT_One-D-Piece-B-256) | 2.70 (generation) |
-| ImageNet  | One-D-Piece-S-256 Generator | [checkpoint (TBP)](https://huggingface.co/turing-motors/MaskGIT_One-D-Piece-S-256) | 2.67 (generation) |
+| ImageNet  | One-D-Piece-L-256 Tokenizer | [checkpoint](https://huggingface.co/turing-motors/One-D-Piece-L-256)| 1.08 (reconstruction) |
+| ImageNet  | One-D-Piece-B-256 Tokenizer | [checkpoint](https://huggingface.co/turing-motors/One-D-Piece-B-256) | 1.11 (reconstruction) |
+| ImageNet  | One-D-Piece-S-256 Tokenizer | [checkpoint](https://huggingface.co/turing-motors/One-D-Piece-S-256) | 1.48 (reconstruction) |
+| ImageNet  | One-D-Piece-L-256 Generator | [checkpoint](https://huggingface.co/turing-motors/MaskGIT_One-D-Piece-L-256)| 2.35 (generation) |
+| ImageNet  | One-D-Piece-B-256 Generator | [checkpoint](https://huggingface.co/turing-motors/MaskGIT_One-D-Piece-B-256) | 2.70 (generation) |
+| ImageNet  | One-D-Piece-S-256 Generator | [checkpoint](https://huggingface.co/turing-motors/MaskGIT_One-D-Piece-S-256) | 2.67 (generation) |
 
 ### Inference
 For just runnnig tokenizer/detokenizer inference, run the following script.
@@ -148,3 +148,18 @@ We have built upon their work by introducing additional features and modificatio
 [Open-MUSE](https://github.com/huggingface/open-muse)
 
 [MUSE-Pytorch](https://github.com/baaivision/MUSE-Pytorch)
+
+
+## Cite
+
+```
+@misc{onedpiece,
+      title        = {One-D-Piece: Image Tokenizer Meets Quality-Controllable Compression},
+      author       = {Keita Miwa and Kento Sasaki and Hidehisa Arai and Tsubasa Takahashi and Yu Yamaguchi},
+      year         = {2025},
+      eprint       = {2501.10064},
+      archivePrefix= {arXiv},
+      primaryClass = {cs.CV},
+      url          = {https://arxiv.org/abs/2501.10064},
+ }
+```
