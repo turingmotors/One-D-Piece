@@ -28,7 +28,7 @@ class OneDPiece(TiTok):
         # x: B x 12 x 1 x num_latent_tokens
         _, _, _, num_tokens = x.shape
         # take index randomly
-        end_indices = torch.randint(1, num_tokens, (1,)).to(x.device)
+        end_indices = torch.randint(1, num_tokens + 1, (1,)).to(x.device)
         # apply tail token drop
         x = x[:, :, :, :end_indices]
         return x
