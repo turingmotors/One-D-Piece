@@ -62,6 +62,7 @@ def sample_fn(generator,
               guidance_scale=3.0,
               guidance_decay="constant",
               guidance_scale_pow=3.0,
+              guidance_interval=-1,
               randomize_temperature=2.0,
               softmax_temperature_annealing=False,
               num_sample_steps=8,
@@ -77,13 +78,14 @@ def sample_fn(generator,
         labels = torch.LongTensor(labels).to(device)
 
     generated_tokens = generator.generate(
-        condition=labels,
+        cond=labels,
+        steps=num_sample_steps,
         guidance_scale=guidance_scale,
         guidance_decay=guidance_decay,
         guidance_scale_pow=guidance_scale_pow,
+        guidance_interval=guidance_interval,
         randomize_temperature=randomize_temperature,
-        softmax_temperature_annealing=softmax_temperature_annealing,
-        num_sample_steps=num_sample_steps)
+        softmax_temperature_annealing=softmax_temperature_annealing)
     
     generated_image = tokenizer.decode_tokens(
         generated_tokens.view(generated_tokens.shape[0], -1)
