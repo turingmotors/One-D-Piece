@@ -274,3 +274,40 @@ class MLMLoss(torch.nn.Module):
         # we only compute correct tokens on masked tokens
         correct_tokens = ((torch.argmax(inputs, dim=1) == targets) * weights).sum(dim=1) / (weights.sum(1) + 1e-8)
         return loss, {"loss": loss, "correct_tokens": correct_tokens.mean()}
+
+
+class MLM_diffullama(torch.nn.Module):
+    """
+    diffullamaの損失
+    baseはCE Loss, 入ってきたテンソルに対してmaskされている
+    """
+    def __init__(self,
+                 config):
+        super().__init__()
+        self.label_smoothing = config.losses.label_smoothing
+        self.loss_weight_unmasked_token = config.losses.loss_weight_unmasked_token
+        self.criterion = torch.nn.CrossEntropyLoss(label_smoothing=self.label_smoothing,
+                                                   reduction="none")
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor,
+                weights=None, timestep=None) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
+        inputs = rearrange(inputs, "b n c -> b c n")
+        loss = self.criterion(inputs, targets)
+        # マスクトークンかどうかの判定を行う
+        # weightsにはmaskが流れてくる
+        weights = weights.to(loss)
+        loss_weights = (1.0 - weights) * self.loss_weight_unmasked_token + weights # set 0 to self.loss_weight_unasked_token
+        loss = (loss * loss_weights).sum() / (loss_weights.sum() + 1e-8)
+        # Apply timestep scaling: multiply by 1/timestep
+        if timestep is not None:
+            timestep_weight = self.timestep_weight(timestep.to(loss.device))
+        
+        # we only compute correct tokens on masked tokens
+        correct_tokens = ((torch.argmax(inputs, dim=1) == targets) * weights).sum(dim=1) / (weights.sum(1) + 1e-8)
+        return loss, {"loss": loss, "correct_tokens": correct_tokens.mean()}
+    
+    
+    def timestep_weight(self, timestep: torch.Tensor):
+        timestep = timestep + 1e-8
+        timestep_weight = 1.0 / timestep
+        return timestep_weight
