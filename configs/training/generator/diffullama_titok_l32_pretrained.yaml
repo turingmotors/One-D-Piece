@@ -1,0 +1,118 @@
+experiment:
+    project: "diffullama_pretrained"
+    name: "diffullama_titok_l32_from_llamagen"
+    output_dir: "checkpoints/diffullama_titok_l32_from_llamagen_run1"
+    max_train_examples: 1_281_167
+    save_every: 5_000
+    eval_every: 25_000
+    generate_every: 500
+    log_every: 50
+    log_grad_norm_every: 1_000
+    resume: True
+    explanation: "DiffuLLaMA initialized from pretrained LlamaGen with TiTok-L32 tokenizer"
+    tokenizer_checkpoint: "tokenizer_titok_l32.bin"
+    # Path to pretrained LlamaGen checkpoint (temporarily disabled for testing)
+    # pretrained_llamagen_checkpoint: "/home/user_00005_821839/workspace/One-D-Piece-Experiment/experiments/llamagen_s128_titok_l32/checkpoint-70000/ema_model/pytorch_model.bin"
+
+model:
+    type: "titok"
+    vq_model:
+        codebook_size: 4096
+        token_size: 12
+        use_l2_norm: True
+        commitment_cost: 0.25
+        # vit arch
+        vit_enc_model_size: "large"
+        vit_dec_model_size: "large"
+        vit_enc_patch_size: 16
+        vit_dec_patch_size: 16
+        num_latent_tokens: 32
+        finetune_decoder: True
+        # relax assertion
+        strict_length_assertion: False
+        # pretrained_tokenizer_weight: "maskgit-vqgan-imagenet-f16-256.bin"
+    
+    generator_type: "diffullama"
+    generator:
+        model_type: "GPT-B"
+        model_args:
+            # Copy hyperparameters from LlamaGen config
+            multiple_of: 256
+            rope_base: 10000
+            norm_eps: 1e-5
+            initializer_range: 0.02
+            
+            token_dropout_p: 0.1
+            attn_dropout_p: 0.0
+            resid_dropout_p: 0.1
+            ffn_dropout_p: 0.1
+            drop_path_rate: 0.0
+
+            num_classes: 1000
+            caption_dim: 2048
+            class_dropout_prob: 0.1
+            model_type: c2i
+
+            vocab_size: 4096
+            cls_token_num: 1
+            block_size: 32
+
+        hidden_size: 768
+        num_hidden_layers: 24
+        num_attention_heads: 16
+        intermediate_size: 3072
+        dropout: 0.1
+        attn_drop: 0.1
+        # DiffuLLaMA specific: diffusion steps
+        num_steps: 8
+        class_label_dropout: 0.1
+        image_seq_len: ${model.vq_model.num_latent_tokens}
+        condition_num_classes: 1000
+        
+        # Sampling parameters (inherited from LlamaGen)
+        randomize_temperature: 1.0
+        guidance_scale: 4.5
+        guidance_decay: "constant"
+
+losses:
+    label_smoothing: 0.1
+    # DiffuLLaMA: No loss weight for unmasked tokens (they are handled by timestep weighting)
+    loss_weight_unmasked_token: 0.0
+
+dataset:
+    params:
+        train_shards_path_or_url: "/home/user_00005_821839/turing_data/dataset/One-D-Piece/imagenet_gaggle/imagenet-train-{000000..000320}.tar"
+        eval_shards_path_or_url: "/home/user_00005_821839/turing_data/dataset/One-D-Piece/imagenet_gaggle/imagenet-val-{000000..000049}.tar"
+        num_workers_per_gpu: 12
+    preprocessing:
+        resize_shorter_edge: 256
+        crop_size: 256
+        random_crop: False  # Same as LlamaGen
+        random_flip: True
+
+optimizer:
+    name: adamw 
+    params:
+        # Use same learning rate as LlamaGen for fine-tuning
+        learning_rate: 1e-4  # Lower than LlamaGen's 2e-4 for fine-tuning
+        beta1: 0.9
+        beta2: 0.95  # Same as LlamaGen
+        weight_decay: 0.05  # Same as LlamaGen
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 2_000  # Shorter warmup for fine-tuning
+        end_lr: 1e-5
+
+training:
+    gradient_accumulation_steps: 1
+    per_gpu_batch_size: 64  # Reduced batch size for memory efficiency
+    mixed_precision: "bf16"
+    enable_tf32: True
+    enable_wandb: True
+    use_ema: True
+    seed: 42
+    max_train_steps: 100_000  # Shorter training for fine-tuning
+    max_grad_norm: 1.0 
