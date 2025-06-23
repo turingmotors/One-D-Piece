@@ -28,12 +28,12 @@ import torch
 from omegaconf import OmegaConf
 from torch.optim import AdamW
 from utils.lr_schedulers import get_scheduler
-from modeling.modules import EMAModel, ReconstructionLoss_Stage1, ReconstructionLoss_Stage2, MLMLoss
+from modeling.modules import EMAModel, ReconstructionLoss_Stage1, ReconstructionLoss_Stage2, MLMLoss, MLM_diffullama
 from modeling.titok import TiTok, PretrainedTokenizer as TiTokPretrainedTokenizer
 from modeling.one_d_piece import OneDPiece, PretrainedTokenizer as OneDPiecePretrainedTokenizer
 from modeling.maskgit import ImageBert, UViTBert
 from eval.utils.evaluator import VQGANEvaluator
-from demo_util import sample_fn
+from demo_util import get_titok_tokenizer, sample_fn
 
 from utils.viz_utils import make_viz_from_samples, make_viz_from_samples_generation
 from torchinfo import summary
@@ -108,9 +108,40 @@ def create_model(config, logger, accelerator,
             model_cls == UViTBert
         else:
             raise ValueError(f"Unsupported generator model_type {config.model.generator.model_type}")
+    elif model_type == "diffullama":
+        from modeling.llamagen_diffustyle import Transformer, ModelArgs
+        model_cls = Transformer
+        # Create ModelArgs from config for DiffuLLaMA
+        model_args = ModelArgs(
+            vocab_size=config.model.generator.model_args.vocab_size,
+            n_layer=config.model.generator.num_hidden_layers,
+            n_head=config.model.generator.num_attention_heads,
+            dim=config.model.generator.hidden_size,
+            block_size=config.model.generator.model_args.block_size,
+            num_classes=config.model.generator.model_args.num_classes,
+            model_type=config.model.generator.model_args.model_type,
+            cls_token_num=config.model.generator.model_args.cls_token_num,
+            multiple_of=config.model.generator.model_args.multiple_of,
+            rope_base=config.model.generator.model_args.rope_base,
+            norm_eps=config.model.generator.model_args.norm_eps,
+            initializer_range=config.model.generator.model_args.initializer_range,
+            token_dropout_p=config.model.generator.model_args.token_dropout_p,
+            attn_dropout_p=config.model.generator.model_args.attn_dropout_p,
+            resid_dropout_p=config.model.generator.model_args.resid_dropout_p,
+            ffn_dropout_p=config.model.generator.model_args.ffn_dropout_p,
+            drop_path_rate=config.model.generator.model_args.drop_path_rate,
+            caption_dim=config.model.generator.model_args.caption_dim,
+            class_dropout_prob=config.model.generator.model_args.class_dropout_prob,
+        )
+        model = model_cls(model_args)
+        # Add mask token for DiffuLLaMA
+        model.add_mask_token()
     else:
         raise ValueError(f"Unsupported model_type {model_type}")
-    model = model_cls(config)
+    
+    # For non-DiffuLLaMA models, use the original config
+    if model_type != "diffullama":
+        model = model_cls(config)
 
     if config.experiment.get("init_weight", ""):
         # If loading a pretrained weight
@@ -157,16 +188,30 @@ def create_model(config, logger, accelerator,
             model_summary_str = summary(model, input_size=input_size, depth=5,
             col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"))
             logger.info(model_summary_str)
-        elif model_type in ["maskgit"]:
+        elif model_type in ["maskgit", "diffullama"]:
             input_size = (1, config.model.vq_model.num_latent_tokens)
-            input_data = [
-                torch.randint(0, config.model.vq_model.codebook_size, input_size),
-                torch.ones(1, dtype=int)
-            ]
-            model_summary_str = summary(
-                model, input_data=input_data, depth=7,
-                col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"))
-            logger.info(model_summary_str)
+            if model_type == "diffullama":
+                # For DiffuLLaMA, use vocab_size and proper class condition
+                vocab_size = config.model.generator.model_args.vocab_size
+                num_classes = config.model.generator.model_args.num_classes
+                input_data = [
+                    torch.randint(0, vocab_size, input_size),  # Use vocab_size for token range
+                    torch.randint(0, num_classes, (1,))  # Class condition
+                ]
+            else:
+                # Original MaskGIT behavior
+                input_data = [
+                    torch.randint(0, config.model.vq_model.codebook_size, input_size),
+                    torch.ones(1, dtype=int)
+                ]
+            # Temporarily disable torchinfo.summary for DiffuLLaMA due to tensor dimension issues
+            if model_type == "diffullama":
+                logger.info(f"DiffuLLaMA model created successfully. Skipping torchinfo summary due to RoPE complexity.")
+            else:
+                model_summary_str = summary(
+                    model, input_data=input_data, depth=7,
+                    col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"))
+                logger.info(model_summary_str)
         else:
             raise ValueError(f"Unsupported model type {model_type}")
         
@@ -180,10 +225,20 @@ def create_model_and_loss_module(config, logger, accelerator,
     # Create model.
     model, ema_model = create_model(config, logger, accelerator, model_type=model_type)
 
+    # Load pretrained LlamaGen weights for DiffuLLaMA if specified
+    if model_type == "diffullama" and config.experiment.get("pretrained_llamagen_checkpoint", None):
+        pretrained_path = config.experiment.pretrained_llamagen_checkpoint
+        logger.info(f"Loading pretrained LlamaGen weights from {pretrained_path}")
+        unwrap_model = accelerator.unwrap_model(model)
+        unwrap_model.load_pretrained_ar(pretrained_path)
+        logger.info("Successfully loaded pretrained LlamaGen weights")
+
     if model_type in ["titok", "one_d_piece"]:
         loss_cls = ReconstructionLoss_Stage2 if config.model.vq_model.finetune_decoder else ReconstructionLoss_Stage1
     elif model_type == "maskgit":
         loss_cls = MLMLoss
+    elif model_type == "diffullama":
+        loss_cls = MLM_diffullama
     else:
         raise ValueError(f"Unsupported model_type {model_type}")
 
@@ -629,23 +684,31 @@ def train_one_epoch_generator(
     model.train()
 
     for i, batch in enumerate(train_dataloader):
+        # generatorを訓練状態に入れる
         model.train()
         if "image" in batch:
+            # 画像をデバイスに転送
             images = batch["image"].to(
                 accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
             )
+            # 条件付けをデバイスに転送
             conditions = batch["class_id"].to(
                 accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
             )
 
+        # batchにはimageしか入っていない！！！+condition.
+
             # Encode images on the flight.
             with torch.no_grad():
                 tokenizer.eval()
-                if config.model.generator_type in ["maskgit"]:
+                # maskgitは出力の長さが固定長なのでここで分岐を入れる
+                if config.model.generator_type in ["maskgit", "diffullama"]:
                     length = config.model.generator.image_seq_len
                 input_tokens = tokenizer.encode(images)[1]["min_encoding_indices"]
+                # tokenizeした画像の一次元出力を得る
                 input_tokens = input_tokens[:,:,:length]
                 assert input_tokens.shape[2] == length, f"Expected input tokens shape {length}, got {input_tokens.shape[2]}"
+                # reshape to (batch_size, seq_len)にして返す
                 input_tokens = input_tokens.reshape(images.shape[0], -1)
         else:
             raise ValueError(f"Not found valid keys: {batch.keys()}")
@@ -657,35 +720,55 @@ def train_one_epoch_generator(
 
         # Randomly masking out input tokens.
         if config.model.generator_type in ["maskgit"]:
-            masked_tokens, masks = unwrap_model.masking_input_tokens(
-                input_tokens)
+            masked_tokens, masks = unwrap_model.masking_input_tokens(input_tokens)
             
-        with accelerator.accumulate([model]):
-            if config.model.generator_type in ["maskgit"]:
+            with accelerator.accumulate([model]):
                 logits = model(masked_tokens, conditions,
                             cond_drop_prob=config.model.generator.class_label_dropout)
-            loss, loss_dict= loss_module(logits, input_tokens, weights=masks)
-            # Gather the losses across all processes for logging.
-            mlm_logs = {}
-            for k, v in loss_dict.items():
-                mlm_logs["train/" + k] = accelerator.gather(v).mean().item()
-            accelerator.backward(loss)
+                loss, loss_dict = loss_module(logits, input_tokens, weights=masks)
+                
+        elif config.model.generator_type in ["diffullama"]:
+            # For diffullama: generate continuous timesteps in [0, 1] range
+            batch_size = input_tokens.shape[0]
+            timesteps = torch.rand(batch_size, device=input_tokens.device)  # Continuous [0, 1]
+            
+            # Pass timesteps to masking function for consistent arccos scheduling
+            masked_tokens, masks, timesteps = unwrap_model.masking_input_tokens(
+                input_tokens, timesteps=timesteps)
+            
+            with accelerator.accumulate([model]):
+                # Forward pass: model expects masked tokens and conditions
+                # The right shift is handled internally in the forward method
+                logits = model(masked_tokens, conditions,
+                            cond_drop_prob=config.model.generator.class_label_dropout)
+                
+                # Loss calculation with timestep weighting
+                # Use mean timestep for batch-level weighting (can be modified for per-sample weighting)
+                loss, loss_dict = loss_module(logits, input_tokens, weights=masks, timestep=timesteps.mean())
+        else:
+            raise ValueError(f"Unsupported generator type: {config.model.generator_type}")
+        
+        # Gather the losses across all processes for logging.
+        mlm_logs = {}
+        for k, v in loss_dict.items():
+            mlm_logs["train/" + k] = accelerator.gather(v).mean().item()
+        accelerator.backward(loss)
 
-            if config.training.max_grad_norm is not None and accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+        if config.training.max_grad_norm is not None and accelerator.sync_gradients:
+            accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
 
-            optimizer.step()
-            lr_scheduler.step()
+        optimizer.step()
+        lr_scheduler.step()
 
-            # Log gradient norm before zeroing it.
-            if (
-                accelerator.sync_gradients
-                and (global_step + 1) % config.experiment.log_grad_norm_every == 0
-                and accelerator.is_main_process
-            ):
-                log_grad_norm(model, accelerator, global_step + 1)
+        # Log gradient norm before zeroing it.
+        if (
+            accelerator.sync_gradients
+            and (global_step + 1) % config.experiment.log_grad_norm_every == 0
+            and accelerator.is_main_process
+        ):
+            log_grad_norm(model, accelerator, global_step + 1)
 
-            optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
 
         if accelerator.sync_gradients:
             if config.training.use_ema:
@@ -855,9 +938,10 @@ def generate_images(model, tokenizer, accelerator,
         guidance_scale=config.model.generator.get("guidance_scale", 3.0),
         guidance_decay=config.model.generator.get("guidance_decay", "constant"),
         guidance_scale_pow=config.model.generator.get("guidance_scale_pow", 3.0),
+        guidance_interval=config.model.generator.get("guidance_interval", -1),
         randomize_temperature=config.model.generator.get("randomize_temperature", 2.0),
         softmax_temperature_annealing=config.model.generator.get("softmax_temperature_annealing", False),
-        num_sample_steps=config.model.generator.get("num_steps", 8),
+        num_sample_steps=config.model.generator.get("num_sample_steps", 8),
         device=accelerator.device,
         return_tensor=True
     )
