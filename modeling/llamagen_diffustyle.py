@@ -221,25 +221,6 @@ class FeedForward(nn.Module):
         return self.ffn_dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
-# 一旦無効にする(呼び出していないことを確認)
-class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_head, head_dim, dtype):
-        super().__init__()
-        cache_shape = (max_batch_size, n_head, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
-
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2], f"Check the shape: {input_pos.shape} and {k_val.shape}"
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
-
-        return k_out, v_out
-
-
 class Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -313,6 +294,8 @@ class TransformerBlock(nn.Module):
         return out
 
 
+# ここまではほとんど変更なし
+#  - attention_maskをcausal=Falseにしているくらい
 # 変えるところ--------------------------------------------------------------------------------->
 class Transformer(BaseModel):
     """
@@ -465,15 +448,47 @@ class Transformer(BaseModel):
                 # tok_embeddingsからmask_idの埋め込みを引いてくる
                 mask_embed = self.tok_embeddings.weight[self.mask_id : self.mask_id + 1]
                 token_embeddings = torch.where((idx == self.mask_id).unsqueeze(-1), mask_embed, token_embeddings)
+            
+            # 右シフトを適用（訓練時と推論時両方）
+            shifted_tokens = None
+            if self.training or (input_pos is None):  # 訓練時または推論時の離散拡散スタイル
+                # 右シフト: 最初の位置にmask_tokenを挿入
+                shifted_tokens = torch.cat([
+                    torch.full((token_embeddings.shape[0], 1), self.mask_id, 
+                              dtype=idx.dtype, device=idx.device),
+                    idx[:, :-1]  # 最後のトークンを除いて右シフト
+                ], dim=1)
+                # 右シフトされたトークンから埋め込みを取得
+                token_embeddings = self.tok_embeddings(shifted_tokens)
+                # mask_tokenの位置を正しい埋め込みに置き換え
+                mask_embed = self.tok_embeddings.weight[self.mask_id : self.mask_id + 1]
+                token_embeddings = torch.where((shifted_tokens == self.mask_id).unsqueeze(-1), 
+                                               mask_embed, token_embeddings)
+            
             token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
             h = self.tok_dropout(token_embeddings)
             self.freqs_cis = self.freqs_cis.to(h.device)
+            
+            # 双方向アテンションを適用（訓練時と推論時両方）
+            if self.training or (input_pos is None):  # 訓練時または推論時の離散拡散スタイル
+                # 右シフト後のトークンを使用してmask_tokenの位置を特定
+                current_tokens = shifted_tokens if shifted_tokens is not None else idx
+                maskable_mask = (current_tokens == self.mask_id)
+                # cls_tokenの部分を追加（cls_tokenは常に見える）
+                zero_cls = torch.zeros_like(maskable_mask[:, :1])
+                maskable_full = torch.cat([zero_cls, maskable_mask], dim=1)
+                # 双方向アテンションマスクを作成
+                mask = bidirectional_attn_mask(maskable_full, dtype=h.dtype)
+                mask = mask.repeat_interleave(self.config.n_head, dim=1)
+        # もしidxがNoneならばcond_idxに応じてcls_embeddingかtok_embeddingsを取得する
+        # 従来のcausal maskを定義（autoregressive生成時のみ）
         else:
             if cond_idx is not None: # prefill in inference
                 token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
             else: # decode_n_tokens(kv cache) in inference
                 token_embeddings = self.tok_embeddings(idx)            
             bs = token_embeddings.shape[0]
+            # causal maskをここで定義
             mask = self.causal_mask[:bs, None, input_pos]
 
             h = self.tok_dropout(token_embeddings)
@@ -485,11 +500,13 @@ class Transformer(BaseModel):
 
         # transformer blocks
         for layer in self.layers:
-            print(mask.shape)
-            print(mask)
+            # デバッグ用のprintを削除
+            # print(mask.shape)
+            # print(mask)
             # visualization
-            plt.figure(figsize=(6, 6))
+            # plt.figure(figsize=(6, 6))
 
+            # ここでcausal maskを与えてレイヤーにする
             h = layer(h, freqs_cis, input_pos, mask)
         
         # output layers
@@ -502,29 +519,116 @@ class Transformer(BaseModel):
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)
     
-    @torch.no_grad()
-    def generate(self, condition, guidance_scale=1.0, top_k=0, top_p=1.0, temperature=1.0, **sampling_kwargs):
-        """
-        generated_tokens = generator.generate(
-            condition=labels,
-            guidance_scale=guidance_scale,
-            guidance_decay=guidance_decay,
-            guidance_scale_pow=guidance_scale_pow,
-            randomize_temperature=randomize_temperature,
-            softmax_temperature_annealing=softmax_temperature_annealing,
-            num_sample_steps=num_sample_steps
-        )
-        """
-        # remove unuseable kwargs
-        return generate(
-            # TODO: hyperparameters should be passed in config
-            self, 
-            cond=condition,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-        )
 
+    def masking_input_tokens(self, input_tokens, timesteps=None):
+        """
+        Randomly mask input tokens for training, similar to MaskGIT
+        """
+        import math
+        from einops import rearrange
+        
+        batch_size, seq_len = input_tokens.shape
+        device = input_tokens.device
+
+        if timesteps is None:
+            timesteps = torch.zeros((batch_size,), device=device).float().uniform_(0, 1.0)
+        mask_ratio = torch.acos(timesteps) / (math.pi * 0.5) # arccos schedule
+        mask_ratio = torch.clamp(mask_ratio, min=1e-6, max=1.)
+        num_token_masked = (seq_len * mask_ratio).round().clamp(min=1)
+        batch_randperm = torch.rand(batch_size, seq_len, device=device).argsort(dim=-1)
+        masks = batch_randperm < rearrange(num_token_masked, 'b -> b 1')
+        masked_tokens = torch.where(masks, self.mask_id, input_tokens)
+        return masked_tokens, masks
+
+
+    
+    
+    @torch.no_grad()
+    def generate(
+        self, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs
+    ):
+        """
+        Generate tokens using discrete diffusion with CFG support.
+        """
+        # 
+        if self.model.model_type == 'c2i':
+            if cfg_scale > 1.0:
+                # クラス数分の1のクラステンソルを作成(無条件用)
+                cond_null = torch.ones_like(cond) * self.model.num_classes
+                # 条件付けを結合(条件付けと無条件を結合)
+                cond_combined = torch.cat([cond, cond_null])
+            else:
+                # 条件付けを結合(条件付けのみ)
+                cond_combined = cond
+            T = 1
+        else:
+            raise Exception("please check model type")
+
+        # 条件付けと設定から作成したseq_lenを足して全体の長さを計算
+        T_new = T + self.block_size
+        max_seq_length = T_new
+        max_batch_size = cond.shape[0]
+        device = cond.device
+
+        """ with torch.device(device):
+            max_batch_size_cfg = max_batch_size * 2 if cfg_scale > 1.0 else max_batch_size
+            # FIXME: specifying bf16 here is a hack to avoid dtype mismatch in the model
+            model.setup_caches(max_batch_size=max_batch_size_cfg, max_seq_length=max_seq_length, dtype=torch.bfloat16) """
+        
+        
+        # Initialize tokens
+        batch_size = cond_combined.shape[0]
+        # maskで初期化
+        ids = torch.full((batch_size, self.block_size), self.mask_id, dtype=torch.long, device=device)
+        # 最初は何も知らない状態で初期化
+        known = torch.zeros_like(ids, dtype=torch.bool)
+
+        # 推論ステップ分だけ繰り返す
+        for t in range(steps, 0, -1):
+            # Create bidirectional attention mask
+            maskable_latent = ~known
+            zero_cls = torch.zeros_like(maskable_latent[:, :1])
+            maskable_full = torch.cat([zero_cls, maskable_latent], dim=1)
+            attn = bidirectional_attn_mask(maskable_full, dtype=torch.float16)
+            # ヘッド分だけ複製する
+            attn = attn.repeat_interleave(self.config.n_head, dim=1)
+
+            # Forward pass
+            seq_len_full = self.cls_token_num + self.block_size
+            full_pos = torch.arange(seq_len_full, device=device)
+
+            # cfgの適用
+            if cfg_scale > 1.0:
+                logits = model(ids, cond_combined, input_pos=full_pos, mask=attn)
+                cond_logits, uncond_logits = torch.split(logits, B, dim=0)
+                logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
+            else:
+                logits = model(ids, cond_combined, input_pos=full_pos, mask=attn)
+            
+            # Sampling
+            logits = logits / max(temperature, 1e-5)
+            logits = top_k_top_p_filtering(logits, top_p=top_p, top_k=top_k)
+            probs = F.softmax(logits, dim=-1)
+            preds = torch.distributions.Categorical(probs).sample()
+            preds = preds[:, :-1]
+            
+            # Use only first B samples for token updates
+            current_ids = ids[:B]
+            current_known = known[:B]
+            
+            # Update tokens
+            current_ids = torch.where(current_known, current_ids, preds)
+            newly = (~current_known) & (torch.rand_like(current_ids.float()) < 1.0 / t)
+            current_known = current_known | newly
+            
+            # Update full batch
+            ids[:B] = current_ids
+            known[:B] = current_known
+            if guidance_scale > 1.0:
+                ids[B:] = current_ids  # Copy to unconditional batch
+                known[B:] = current_known
+
+        return ids[:B]
 
 
 # Modified from:
@@ -651,60 +755,13 @@ def decode_n_tokens(
     return new_tokens, new_probs
 
 
-@torch.no_grad()
-# diffusion style
-def generate(
-    self, cond: torch.Tensor, steps: int = 8, top_p: float = 0.9, top_k: int =0, temperature: float = 1.0
-):
-    B = cond.size(0)
-    device = cond.device
-    # fix
-    ids = torch.full((B, self.block_size), self.mask_id, dtype=torch.long, device=device)
-    known = torch.zeros_like(ids, dtype=torch.bool)
-
-    for t in range(steps, 0, -1):
-        maskable_latent = ~known
-        print(f'step{t}: known ->', known)
-
-        zero_cls        = torch.zeros_like(maskable_latent[:, :1])
-        maskable_full   = torch.cat([zero_cls, maskable_latent], dim=1)
-
-        attn = bidirectional_attn_mask(maskable_full, dtype=torch.float16)
-        attn = attn.repeat_interleave(self.config.n_head, dim=1)
-
-        save_attention_mask(attn, step_idx=t, head_dim=self.config.n_head)
-
-        seq_len_full = self.cls_token_num + self.block_size
-        full_pos = torch.arange(seq_len_full, device=device)
-
-        logits = self(ids, cond, input_pos=full_pos, mask=attn)
-        logits = logits / max(temperature, 1e-5)
-        logits = top_k_top_p_filtering(logits, top_p=top_p, top_k=top_k)
-        probs = F.softmax(logits, dim=-1)
-        # ここまで普通のサンプル
-        preds = torch.distributions.Categorical(probs).sample()
-        # print(preds.shape)
-        preds = preds[:, :-1]
-        ids = torch.where(known, ids, preds)
-        
-        
-        newly = (~known) & (torch.rand_like(ids.float()) < 1.0 / t)
-        known = known | newly
-    print('step0: known ->', known)
-    # 以下マスクを可視化するためのコード
-    maskable_latent = ~known
-    zero_cls        = torch.zeros_like(maskable_latent[:, :1])
-    maskable_full   = torch.cat([zero_cls, maskable_latent], dim=1)
-    attn = bidirectional_attn_mask(maskable_full, dtype=torch.float16)
-    attn = attn.repeat_interleave(self.config.n_head, dim=1)
-    save_attention_mask(attn, step_idx=0, head_dim=self.config.n_head)
-    return ids
-
-
-def save_attention_mask(attn, step_idx, head_dim, save_dir="attn_viz"):
+#  attn_maskの可視化
+def save_attention_mask(attn, step_idx, head_dim, save_dir=None):
     """
     attn: torch.Tensor of shape (B, num_heads, L, L)
     """
+    if save_dir is None:
+        save_dir = os.environ.get('ATTN_VIZ_DIR', 'attn_viz')
     os.makedirs(save_dir, exist_ok=True)
     B, _, L, _ = attn.shape
 
@@ -721,6 +778,79 @@ def save_attention_mask(attn, step_idx, head_dim, save_dir="attn_viz"):
             plt.close()
             if h == 0:
                 break
+
+
+# トークンの可視化
+def save_token_visualization(tokens, mask_id, step_idx, save_dir=None, grid_size=(4, 8), token_size=20):
+    """
+    tokens: torch.Tensor of shape (B, seq_len)
+    mask_id: マスクトークンのID
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    
+    if save_dir is None:
+        save_dir = os.environ.get('TOKEN_VIZ_DIR', 'token_viz')
+    os.makedirs(save_dir, exist_ok=True)
+    B, seq_len = tokens.shape
+    
+    # グリッドサイズを計算
+    if seq_len != grid_size[0] * grid_size[1]:
+        # 32トークンの場合、4x8グリッド
+        grid_size = (4, 8)
+    
+    for b in range(B):
+        # カラーマップを作成（mask_id以外のトークン用）
+        colors = plt.cm.viridis(np.linspace(0, 1, seq_len))
+        
+        # 画像を作成
+        img_size = (grid_size[1] * token_size, grid_size[0] * token_size)
+        img = Image.new('RGB', img_size, color='white')
+        draw = ImageDraw.Draw(img)
+        
+        # フォントを設定
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 10)
+        except:
+            font = ImageFont.load_default()
+        
+        for i in range(seq_len):
+            row = i // grid_size[1]
+            col = i % grid_size[1]
+            
+            x = col * token_size
+            y = row * token_size
+            
+            token_id = tokens[b, i].item()
+            
+            if token_id == mask_id:
+                # マスクトークンは灰色
+                color = (128, 128, 128)
+                bg_color = (200, 200, 200)
+            else:
+                # その他のトークンは色付き
+                color_idx = token_id % len(colors)
+                color = tuple(int(c * 255) for c in colors[color_idx][:3])
+                bg_color = tuple(int(c * 255 * 0.3) for c in colors[color_idx][:3])
+            
+            # 背景を描画
+            draw.rectangle([x, y, x + token_size - 1, y + token_size - 1], fill=bg_color, outline=color, width=1)
+            
+            # トークンIDを描画
+            text = str(token_id)
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            
+            text_x = x + (token_size - text_width) // 2
+            text_y = y + (token_size - text_height) // 2
+            
+            draw.text((text_x, text_y), text, fill=color, font=font)
+        
+        # 保存
+        filename = os.path.join(save_dir, f"tokens_step_{step_idx:02d}_b{b}.png")
+        img.save(filename)
 
 #################################################################################
 #                      Rotary Positional Embedding Functions                    #
