@@ -78,7 +78,10 @@ class TiTok(BaseModel, PyTorchModelHubMixin, tags=["arxiv:2304.12244", "image-to
         super().__init__()
         self.config = config
         # This should be False for stage1 and True for stage2.
-        self.finetune_decoder = config.model.vq_model.get("finetune_decoder", True)
+        self.is_single_training = config.model.vq_model.is_single_training
+        self.clustering_vq = config.model.vq_model.clustering_vq
+        self.finetune_decoder = config.model.vq_model.finetune_decoder
+        self.only_finetune_decoder = not self.is_single_training and self.finetune_decoder
         self.encoder = TiTokEncoder(config)
         self.decoder = TiTokDecoder(config)
         
@@ -93,9 +96,10 @@ class TiTok(BaseModel, PyTorchModelHubMixin, tags=["arxiv:2304.12244", "image-to
             codebook_size=config.model.vq_model.codebook_size,
             token_size=config.model.vq_model.token_size,
             commitment_cost=config.model.vq_model.commitment_cost,
-            use_l2_norm=config.model.vq_model.use_l2_norm,)
+            use_l2_norm=config.model.vq_model.use_l2_norm,
+            clustering_vq=self.clustering_vq)
         
-        if self.finetune_decoder:
+        if self.only_finetune_decoder:
             # Freeze encoder/quantizer/latent tokens
             self.latent_tokens.requires_grad_(False)
             self.encoder.eval()
@@ -143,7 +147,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin, tags=["arxiv:2304.12244", "image-to
             module.weight.data.fill_(1.0)
 
     def encode(self, x):
-        if self.finetune_decoder:
+        if self.only_finetune_decoder:
             with torch.no_grad():
                 self.encoder.eval()
                 self.quantize.eval()
@@ -161,7 +165,7 @@ class TiTok(BaseModel, PyTorchModelHubMixin, tags=["arxiv:2304.12244", "image-to
         if length is not None:
             z_quantized = z_quantized[:, :, :, :length]
         decoded = self.decoder(z_quantized)
-        if self.finetune_decoder:
+        if self.only_finetune_decoder:
             quantized_states = torch.einsum(
                 'nchw,cd->ndhw', decoded.softmax(1),
                 self.pixel_quantize.embedding.weight)
