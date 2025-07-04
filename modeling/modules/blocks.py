@@ -215,7 +215,7 @@ class TiTokEncoder(nn.Module):
         self.model_size = config.model.vq_model.vit_enc_model_size
         self.num_latent_tokens = config.model.vq_model.num_latent_tokens
         self.token_size = config.model.vq_model.token_size
-        self.is_legacy = not config.model.vq_model.is_single_stage
+        self.is_legacy = not config.model.vq_model.is_single_training
 
         self.width = {
                 "small": 512,
@@ -275,10 +275,6 @@ class TiTokEncoder(nn.Module):
         
         latent_tokens = x[:, 1+self.grid_size**2:]
         latent_tokens = self.ln_post(latent_tokens)
-        if needs_width_reduction:
-            latent_tokens = latent_tokens.reshape(batch_size, self.width, self.num_latent_tokens, 1)
-            latent_tokens = self.conv_out(latent_tokens)
-            latent_tokens = latent_tokens.reshape(batch_size, self.token_size, 1, self.num_latent_tokens)
         
         if self.is_legacy:
             latent_tokens = latent_tokens.reshape(batch_size, self.width, self.num_latent_tokens, 1)
@@ -302,7 +298,7 @@ class TiTokDecoder(nn.Module):
         self.model_size = config.model.vq_model.vit_dec_model_size
         self.num_latent_tokens = config.model.vq_model.num_latent_tokens
         self.token_size = config.model.vq_model.token_size
-        self.is_legacy = not config.model.vq_model.is_single_stage
+        self.is_legacy = not config.model.vq_model.is_single_training
         self.width = {
                 "small": 512,
                 "base": 768,
@@ -343,6 +339,7 @@ class TiTokDecoder(nn.Module):
                 nn.Tanh(),
                 nn.Conv2d(2 * self.width, 1024, 1, padding=0, bias=True),
             )
+            self.conv_out = nn.Identity()
         else:
             self.ffn = nn.Sequential(
                 nn.Conv2d(self.width, self.patch_size * self.patch_size *3, 1, padding=0, bias=True),
