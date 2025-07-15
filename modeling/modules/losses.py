@@ -274,3 +274,74 @@ class MLMLoss(torch.nn.Module):
         # we only compute correct tokens on masked tokens
         correct_tokens = ((torch.argmax(inputs, dim=1) == targets) * weights).sum(dim=1) / (weights.sum(1) + 1e-8)
         return loss, {"loss": loss, "correct_tokens": correct_tokens.mean()}
+
+
+class ReconstructionLoss_Single_Stage(ReconstructionLoss_Stage2):
+    def __init__(self, config):
+        super().__init__(config)  # initialise Stage‑2 machinery
+
+    def _forward_generator(
+        self,
+        inputs: torch.Tensor,
+        reconstructions: torch.Tensor,
+        extra_result_dict: Mapping[Text, torch.Tensor],
+        global_step,
+    ) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
+        # ------------------------------------------------------------------
+        #   reconstruction + perceptual
+        # ------------------------------------------------------------------
+        if self.reconstruction_loss == "l1":
+            recon_loss = F.l1_loss(inputs, reconstructions, reduction="mean")
+        elif self.reconstruction_loss == "l2":
+            recon_loss = F.mse_loss(inputs, reconstructions, reduction="mean")
+        else:
+            raise ValueError(
+                f"Unsupported reconstruction_loss '{self.reconstruction_loss}'."
+            )
+
+        recon_loss = recon_loss * self.reconstruction_weight
+        perceptual_loss = self.perceptual_loss(inputs, reconstructions).mean()
+
+        discriminator_factor = (
+            self.discriminator_factor
+            if self.should_discriminator_be_trained(global_step)
+            else 0.0
+        )
+        g_gan_loss = torch.zeros((), device=inputs.device)
+        if discriminator_factor > 0.0 and self.discriminator_weight > 0.0:
+            for p in self.discriminator.parameters():
+                p.requires_grad = False
+            g_gan_loss = -self.discriminator(reconstructions).mean()
+
+        d_weight = self.discriminator_weight
+
+        q_loss = extra_result_dict["quantizer_loss"]
+        bottleneck_term = self.quantizer_weight * q_loss
+        # prepare log items
+        bottleneck_log = {
+            "quantizer_loss": bottleneck_term.detach(),
+            "commitment_loss": extra_result_dict["commitment_loss"].detach(),
+            "codebook_loss": extra_result_dict["codebook_loss"].detach(),
+        }
+
+        total_loss = (
+            recon_loss
+            + self.perceptual_weight * perceptual_loss
+            + bottleneck_term
+            + d_weight * discriminator_factor * g_gan_loss
+        )
+
+        loss_dict = {
+            "total_loss": total_loss.detach(),
+            "reconstruction_loss": recon_loss.detach(),
+            "perceptual_loss": (self.perceptual_weight * perceptual_loss).detach(),
+            "weighted_gan_loss": (
+                d_weight * discriminator_factor * g_gan_loss
+            ).detach(),
+            "discriminator_factor": torch.as_tensor(discriminator_factor),
+            "d_weight": d_weight,
+            "gan_loss": g_gan_loss.detach(),
+            **bottleneck_log,
+        }
+
+        return total_loss, loss_dict

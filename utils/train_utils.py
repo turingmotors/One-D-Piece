@@ -28,7 +28,7 @@ import torch
 from omegaconf import OmegaConf
 from torch.optim import AdamW
 from utils.lr_schedulers import get_scheduler
-from modeling.modules import EMAModel, ReconstructionLoss_Stage1, ReconstructionLoss_Stage2, MLMLoss
+from modeling.modules import EMAModel, ReconstructionLoss_Stage1, ReconstructionLoss_Stage2, ReconstructionLoss_Single_Stage, MLMLoss
 from modeling.titok import TiTok, PretrainedTokenizer as TiTokPretrainedTokenizer
 from modeling.one_d_piece import OneDPiece, PretrainedTokenizer as OneDPiecePretrainedTokenizer
 from modeling.maskgit import ImageBert, UViTBert
@@ -181,7 +181,12 @@ def create_model_and_loss_module(config, logger, accelerator,
     model, ema_model = create_model(config, logger, accelerator, model_type=model_type)
 
     if model_type in ["titok", "one_d_piece"]:
-        loss_cls = ReconstructionLoss_Stage2 if config.model.vq_model.finetune_decoder else ReconstructionLoss_Stage1
+        if config.model.vq_model.is_single_training:
+            loss_cls = ReconstructionLoss_Single_Stage
+        elif config.model.vq_model.finetune_decoder:
+            loss_cls = ReconstructionLoss_Stage2
+        else:
+            loss_cls = ReconstructionLoss_Stage1
     elif model_type == "maskgit":
         loss_cls = MLMLoss
     else:

@@ -24,6 +24,7 @@ import torch.nn as nn
 from collections import OrderedDict
 import einops
 from typing import Optional
+from einops.layers.torch import Rearrange
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -214,6 +215,7 @@ class TiTokEncoder(nn.Module):
         self.model_size = config.model.vq_model.vit_enc_model_size
         self.num_latent_tokens = config.model.vq_model.num_latent_tokens
         self.token_size = config.model.vq_model.token_size
+        self.is_legacy = not config.model.vq_model.is_single_training
 
         self.width = {
                 "small": 512,
@@ -273,10 +275,15 @@ class TiTokEncoder(nn.Module):
         
         latent_tokens = x[:, 1+self.grid_size**2:]
         latent_tokens = self.ln_post(latent_tokens)
-        if needs_width_reduction:
+        
+        if self.is_legacy:
             latent_tokens = latent_tokens.reshape(batch_size, self.width, self.num_latent_tokens, 1)
-            latent_tokens = self.conv_out(latent_tokens)
-            latent_tokens = latent_tokens.reshape(batch_size, self.token_size, 1, self.num_latent_tokens)
+        else:
+            latent_tokens = latent_tokens.reshape(batch_size, self.num_latent_tokens, self.width, 1).permute(0, 2, 1, 3)
+
+        latent_tokens = self.conv_out(latent_tokens)
+        latent_tokens = latent_tokens.reshape(batch_size, self.token_size, 1, self.num_latent_tokens)
+
         return latent_tokens
     
 
@@ -291,6 +298,7 @@ class TiTokDecoder(nn.Module):
         self.model_size = config.model.vq_model.vit_dec_model_size
         self.num_latent_tokens = config.model.vq_model.num_latent_tokens
         self.token_size = config.model.vq_model.token_size
+        self.is_legacy = not config.model.vq_model.is_single_training
         self.width = {
                 "small": 512,
                 "base": 768,
@@ -325,13 +333,20 @@ class TiTokDecoder(nn.Module):
             ))
         self.ln_post = nn.LayerNorm(self.width)
 
-        self.ffn = nn.Sequential(
-            nn.Conv2d(self.width, 2 * self.width, 1, padding=0, bias=True),
-            nn.Tanh(),
-            nn.Conv2d(2 * self.width, 1024, 1, padding=0, bias=True),
-        )
-        self.conv_out = nn.Identity()
-    
+        if self.is_legacy:
+            self.ffn = nn.Sequential(
+                nn.Conv2d(self.width, 2 * self.width, 1, padding=0, bias=True),
+                nn.Tanh(),
+                nn.Conv2d(2 * self.width, 1024, 1, padding=0, bias=True),
+            )
+            self.conv_out = nn.Identity()
+        else:
+            self.ffn = nn.Sequential(
+                nn.Conv2d(self.width, self.patch_size * self.patch_size *3, 1, padding=0, bias=True),
+                Rearrange("b (p1 p2 c) h w -> b c (h p1) (w p2)",
+                p1=self.patch_size, p2=self.patch_size))
+            self.conv_out = nn.Conv2d(3, 3, 3, padding=1, bias=True)
+
     def forward(self, z_quantized):
         N, C, H, W = z_quantized.shape
         if self.strict_length_assertion:
