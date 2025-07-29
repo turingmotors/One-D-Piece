@@ -1,0 +1,59 @@
+experiment:
+    project: "linear_probing_one_d_piece_l256_len32"
+    name: "linear_probing_one_d_piece_l256_len32_run1"
+    output_dir: "checkpoints/linear_probing_one_d_piece_l256_len32_run1"
+    max_train_examples: 1_281_167
+    save_every: 5_000
+    eval_every: 1_000
+    generate_every: 500
+    log_every: 50
+    log_grad_norm_every: 1_000
+    resume: True
+    explanation: "linear probing"
+    tokenizer_checkpoint: "one-d-piece-l-256.bin"
+    length: 32
+
+model:
+    type: "linear_probing"
+    vq_model:
+        codebook_size: 4096
+        token_size: 12
+        use_l2_norm: True
+        commitment_cost: 0.25
+        # vit arch
+        vit_enc_model_size: "large"
+        vit_dec_model_size: "large"
+        vit_enc_patch_size: 16
+        vit_dec_patch_size: 16
+        num_latent_tokens: 256
+        finetune_decoder: True
+        # relax assertion
+        strict_length_assertion: False
+    
+    classifier:
+        # num_latent_tokens * token_size
+        feature_dim: 384
+        # imagenet class
+        num_classes: 1000
+
+dataset:
+    params:
+        train_shards_path_or_url: "/data/dataset/imagenet/imagenet-train-{000000..000320}.tar"
+        eval_shards_path_or_url: "/data/dataset/imagenet/imagenet-val-{000000..000049}.tar"
+        num_workers_per_gpu: 12
+    preprocessing:
+        resize_shorter_edge: 256
+        crop_size: 256
+        random_crop: True
+        random_flip: True
+
+training:
+    gradient_accumulation_steps: 2
+    per_gpu_batch_size: 1024 # 4 GPU, total batch size 16384
+    mixed_precision: "bf16"
+    enable_tf32: True
+    enable_wandb: True
+    use_ema: False
+    seed: 42
+    max_train_steps: 10_000
+    max_grad_norm: 1.0

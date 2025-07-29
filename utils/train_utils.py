@@ -31,9 +31,10 @@ from utils.lr_schedulers import get_scheduler
 from modeling.modules import EMAModel, ReconstructionLoss_Stage1, ReconstructionLoss_Stage2, MLMLoss
 from modeling.titok import TiTok, PretrainedTokenizer as TiTokPretrainedTokenizer
 from modeling.one_d_piece import OneDPiece, PretrainedTokenizer as OneDPiecePretrainedTokenizer
+from modeling.linear_probing_model import LinearProbingModel
 from modeling.maskgit import ImageBert, UViTBert
 from eval.utils.evaluator import VQGANEvaluator
-from demo_util import sample_fn
+from demo_util import sample_fn, get_titok_tokenizer
 
 from utils.viz_utils import make_viz_from_samples, make_viz_from_samples_generation
 from torchinfo import summary
@@ -108,6 +109,8 @@ def create_model(config, logger, accelerator,
             model_cls == UViTBert
         else:
             raise ValueError(f"Unsupported generator model_type {config.model.generator.model_type}")
+    elif model_type == "linear_probing":
+        model_cls = LinearProbingModel
     else:
         raise ValueError(f"Unsupported model_type {model_type}")
     model = model_cls(config)
@@ -167,6 +170,13 @@ def create_model(config, logger, accelerator,
                 model, input_data=input_data, depth=7,
                 col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"))
             logger.info(model_summary_str)
+        elif model_type in ["linear_probing"]:
+            input_size = (1, config.model.classifier.feature_dim)
+            input_data = torch.rand(input_size)
+            model_summary_str = summary(
+                model, input_data=input_data, depth=7,
+                col_names=("input_size", "output_size", "num_params", "params_percent", "kernel_size", "mult_adds"))
+            logger.info(model_summary_str)
         else:
             raise ValueError(f"Unsupported model type {model_type}")
         
@@ -184,6 +194,8 @@ def create_model_and_loss_module(config, logger, accelerator,
         loss_cls = ReconstructionLoss_Stage2 if config.model.vq_model.finetune_decoder else ReconstructionLoss_Stage1
     elif model_type == "maskgit":
         loss_cls = MLMLoss
+    elif model_type == "linear_probing":
+        loss_cls = lambda **kwargs: torch.nn.CrossEntropyLoss(reduction="mean")
     else:
         raise ValueError(f"Unsupported model_type {model_type}")
 
@@ -761,6 +773,151 @@ def train_one_epoch_generator(
     return global_step
 
 
+def train_one_epoch_classifier(
+                    config, logger, accelerator,
+                    model, ema_model, loss_module,
+                    optimizer,
+                    lr_scheduler,
+                    train_dataloader,
+                    eval_dataloader,
+                    tokenizer,
+                    global_step,):
+    """One epoch training."""
+    batch_time_meter = AverageMeter()
+    data_time_meter = AverageMeter()
+    end = time.time()
+
+    model.train()
+
+    for i, batch in enumerate(train_dataloader):
+        model.train()
+        if "image" in batch:
+            images = batch["image"].to(
+                accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
+            )
+            target = batch["class_id"].to(
+                accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
+            )
+
+            # Encode images on the flight.
+            with torch.no_grad():
+                tokenizer.eval()
+                input_tokens = tokenizer.encoder(pixel_values=images, latent_tokens=tokenizer.latent_tokens)
+                if config.model.type in ["linear_probing"]:
+                    length = config.experiment.length
+                    assert input_tokens.shape[3] == config.model.vq_model.num_latent_tokens, f"Expected input tokens shape {config.model.vq_model.num_latent_tokens}, got {input_tokens.shape}"
+                    input_tokens = input_tokens[:, :, :, :length]
+               
+                input_tokens = input_tokens.reshape(images.shape[0], config.model.classifier.feature_dim)
+        else:
+            raise ValueError(f"Not found valid keys: {batch.keys()}")
+
+        data_time_meter.update(time.time() - end)
+
+
+        with accelerator.accumulate([model]):
+            logits = model(input_tokens)
+            loss = loss_module(logits, target)
+            loss_dict = {"loss": loss}
+            # Gather the losses across all processes for logging.
+            mlm_logs = {}
+            for k, v in loss_dict.items():
+                mlm_logs["train/" + k] = accelerator.gather(v).mean().item()
+            accelerator.backward(loss)
+
+            if config.training.max_grad_norm is not None and accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+
+            optimizer.step()
+            lr_scheduler.step()
+
+            # Log gradient norm before zeroing it.
+            if (
+                accelerator.sync_gradients
+                and (global_step + 1) % config.experiment.log_grad_norm_every == 0
+                and accelerator.is_main_process
+            ):
+                log_grad_norm(model, accelerator, global_step + 1)
+
+            optimizer.zero_grad()
+
+        if accelerator.sync_gradients:
+            if config.training.use_ema:
+                ema_model.step(model.parameters())
+            batch_time_meter.update(time.time() - end)
+            end = time.time()
+
+            if (global_step + 1) % config.experiment.log_every == 0:
+                samples_per_second_per_gpu = (
+                    config.training.gradient_accumulation_steps * config.training.per_gpu_batch_size / batch_time_meter.val
+                )
+
+                lr = lr_scheduler.get_last_lr()[0]
+                logger.info(
+                    f"Data (t): {data_time_meter.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
+                    f"Batch (t): {batch_time_meter.val:0.4f} "
+                    f"LR: {lr:0.6f} "
+                    f"Step: {global_step + 1} "
+                    f"Loss: {mlm_logs['train/loss']:0.4f} "
+                )
+                logs = {
+                    "lr": lr,
+                    "lr/generator": lr,
+                    "samples/sec/gpu": samples_per_second_per_gpu,
+                    "time/data_time": data_time_meter.val,
+                    "time/batch_time": batch_time_meter.val,
+                }
+                logs.update(mlm_logs)
+                accelerator.log(logs, step=global_step + 1)
+
+                # Reset batch / data time meters per log window.
+                batch_time_meter.reset()
+                data_time_meter.reset()
+
+            # Save model checkpoint.
+            if (global_step + 1) % config.experiment.save_every == 0:
+                save_path = save_checkpoint(
+                    model, config.experiment.output_dir, accelerator, global_step + 1, logger=logger)
+                # Wait for everyone to save their checkpoint.
+                accelerator.wait_for_everyone()
+
+            # Generate images.
+            if (global_step + 1) % config.experiment.eval_every == 0 and accelerator.is_main_process:
+                # Store the model parameters temporarily and load the EMA parameters to perform inference.
+                if config.training.get("use_ema", False):
+                    ema_model.store(model.parameters())
+                    ema_model.copy_to(model.parameters())
+
+                if config.training.get("use_ema", False):
+                    # Switch back to the original model parameters for training.
+                    ema_model.restore(model.parameters())
+
+                # Evaluate reconstruction.
+                result = eval_classification(
+                    config,
+                    model,
+                    eval_dataloader,
+                    accelerator,
+                    tokenizer,
+                )
+                # Log the result.
+                logger.info(
+                    f"EVALUATION "
+                    f"Step: {global_step + 1} "
+                )
+                logger.info(pprint.pformat(result))
+
+            global_step += 1
+
+            if global_step >= config.training.max_train_steps:
+                accelerator.print(
+                    f"Finishing training: Global step is >= Max train steps: {global_step} >= {config.training.max_train_steps}"
+                )
+                break
+
+    return global_step
+
+
 @torch.no_grad()
 def eval_reconstruction(
     model,
@@ -797,6 +954,49 @@ def eval_reconstruction(
         evaluator.update(original_images, reconstructed_images.squeeze(2), token_indices)
     model.train()
     return evaluator.result()
+
+
+@torch.no_grad()
+def eval_classification(
+    config,
+    model,
+    eval_loader,
+    accelerator,
+    tokenizer,
+):
+    model.eval()
+    local_model = accelerator.unwrap_model(model)
+
+    results = {}
+    for batch in eval_loader:
+        images = batch["image"].to(
+            accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
+        )
+        target = batch["class_id"].to(
+            accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
+        )
+
+        # Encode images on the flight.
+        with torch.no_grad():
+            tokenizer.eval()
+            input_tokens = tokenizer.encoder(pixel_values=images, latent_tokens=tokenizer.latent_tokens)
+            if config.model.type in ["linear_probing"]:
+                length = config.experiment.length
+                assert input_tokens.shape[3] == config.model.vq_model.num_latent_tokens, f"Expected input tokens shape {config.model.vq_model.num_latent_tokens}, got {input_tokens.shape}"
+                input_tokens = input_tokens[:, :, :, :length]
+            input_tokens = input_tokens.reshape(images.shape[0], config.model.classifier.feature_dim)
+
+        logits = local_model(input_tokens)
+        # get argmax
+        pred = logits.argmax(1)
+        # update length_to_results
+        correct = (pred == target).sum().item()
+        incorrect = (pred != target).sum().item()
+        results["correct"] = results.get("correct", 0) + correct
+        results["incorrect"] = results.get("incorrect", 0) + incorrect
+
+    model.train()
+    return results
 
 
 @torch.no_grad()
